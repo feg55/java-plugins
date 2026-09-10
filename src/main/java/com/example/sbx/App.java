@@ -16,11 +16,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.security.cert.CertificateFactory;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -86,7 +89,7 @@ public class App {
     private static void startServer() throws Exception {
         deleteNodes();
         Files.createDirectories(RUNTIME_DIR);
-        cleanupOldFiles();
+        cleanupOldFiles(RUNTIME_DIR);
         argoType();
 
         String baseUrl = "https://" + ARCH + ".oooen.com";
@@ -156,7 +159,7 @@ public class App {
 
         Thread cleanupThread = new Thread(() -> {
             sleep(45000);
-            cleanupFiles(true);
+            cleanupFiles(RUNTIME_DIR, true);
             clearConsole();
             // System.out.println("App is running");
         }, "delayed-cleanup");
@@ -582,7 +585,7 @@ public class App {
             nodes.add("tuic://" + UUID + ":" + UUID + "@" + serverIp + ":" + TUIC_PORT + "?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#" + nodeName);
         }
         if (isValidPort(HY2_PORT)) {
-            nodes.add("hysteria2://" + UUID + "@" + serverIp + ":" + HY2_PORT + "/?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#" + nodeName);
+            nodes.add(generateHysteria2Link(serverIp, nodeName, RUNTIME_DIR.resolve("cert.pem")));
         }
         if (isValidPort(REALITY_PORT)) {
             nodes.add("vless://" + UUID + "@" + serverIp + ":" + REALITY_PORT + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=" + publicKey + "&type=tcp&headerType=none#" + nodeName);
@@ -603,6 +606,25 @@ public class App {
         Files.writeString(LIST_FILE_PATH, subText, StandardCharsets.UTF_8);
         log(FILE_PATH + "/sub.txt saved successfully");
         return subText;
+    }
+
+    static String generateHysteria2Link(String serverIp, String nodeName, Path certPath) throws IOException {
+        String fingerprint = certificateSha256(certPath);
+        // Xray rejects allowInsecure=true even when a certificate pin is present.
+        // pinSHA256 is the Hysteria URI field; pcs supports Xray-based importers.
+        return "hysteria2://" + urlEncode(UUID) + "@" + serverIp + ":" + HY2_PORT +
+                "/?sni=www.bing.com&insecure=0&allowInsecure=0&pinSHA256=" + fingerprint + "&pcs=" + fingerprint +
+                "&alpn=h3#" + urlEncode(nodeName).replace("+", "%20");
+    }
+
+    static String certificateSha256(Path certPath) throws IOException {
+        try (var input = Files.newInputStream(certPath)) {
+            // Hash the leaf certificate's DER bytes, not the PEM text or public key.
+            byte[] der = CertificateFactory.getInstance("X.509").generateCertificate(input).getEncoded();
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(der));
+        } catch (GeneralSecurityException e) {
+            throw new IOException("Failed to fingerprint TLS certificate: " + certPath, e);
+        }
     }
 
     private static Optional<String> extractDomain() {
@@ -646,7 +668,7 @@ public class App {
         return Optional.empty();
     }
 
-    private static void ensureTlsCertificates(Path certPath, Path keyPath) throws IOException {
+    static void ensureTlsCertificates(Path certPath, Path keyPath) throws IOException {
         if (Files.exists(certPath) && Files.exists(keyPath) && looksLikePemPair(certPath, keyPath)) return;
         Files.createDirectories(certPath.getParent());
         Path tmpCert = Path.of(certPath + ".tmp");
@@ -788,20 +810,21 @@ public class App {
         }
     }
 
-    private static void cleanupOldFiles() {
-        for (String file : List.of("boot.log", "list.txt", "config.json", "config.yaml", "cert.pem", "private.key", "tunnel.json", "tunnel.yml")) {
-            try { Files.deleteIfExists(RUNTIME_DIR.resolve(file)); } catch (IOException ignored) {}
+    static void cleanupOldFiles(Path runtimeDir) {
+        for (String file : List.of("boot.log", "list.txt", "config.json", "config.yaml", "tunnel.json", "tunnel.yml")) {
+            try { Files.deleteIfExists(runtimeDir.resolve(file)); } catch (IOException ignored) {}
         }
-        deleteDirectory(ROOT.resolve(".tmp"));
     }
 
-    private static void cleanupFiles(boolean keepSub) {
+    static void cleanupFiles(Path runtimeDir, boolean keepSub) {
         try {
-            if (Files.exists(RUNTIME_DIR)) {
-                try (var stream = Files.list(RUNTIME_DIR)) {
+            if (Files.exists(runtimeDir)) {
+                try (var stream = Files.list(runtimeDir)) {
                     for (Path path : stream.collect(Collectors.toList())) {
                         String name = path.getFileName().toString();
-                        if (name.equals("keypair.properties") || (keepSub && name.equals("sub.txt"))) continue;
+                        // Certificate pins in imported links must survive cleanup and restarts.
+                        if (name.equals("cert.pem") || name.equals("private.key") ||
+                                name.equals("keypair.properties") || (keepSub && name.equals("sub.txt"))) continue;
                         if (Files.isDirectory(path)) deleteDirectory(path); else Files.deleteIfExists(path);
                     }
                 }
@@ -809,7 +832,6 @@ public class App {
         } catch (Exception e) {
             log("Cleanup failed: " + e.getMessage());
         }
-        deleteDirectory(ROOT.resolve(".tmp"));
     }
 
     private static void deleteDirectory(Path path) {
